@@ -15,15 +15,21 @@ import (
 
 const (
 	// GcmSendEndpoint is the endpoint for sending messages to the GCM server.
-	GcmSendEndpoint = "https://android.googleapis.com/gcm/send"
+	gcmSendEndpoint = "https://android.googleapis.com/gcm/send"
 	// Initial delay before first retry, without jitter.
 	backoffInitialDelay = 1000
 	// Maximum delay before a retry.
 	maxBackoffDelay = 1024000
+	// Buffer size of input channels
+	sizeOfInputChannels = 20
+	// Buffer size of response channels
+	sizeOfResponseChannel = 5
+	// Number of retries for each send
+	numberOfRetries = 2
 )
 
 // Declared as a mutable variable for testing purposes.
-var gcmSendEndpoint = GcmSendEndpoint
+var GcmSendEndpoint = gcmSendEndpoint
 
 // Sender abstracts the interaction between the application server and the
 // GCM server. The developer must obtain an API key from the Google APIs
@@ -44,8 +50,28 @@ var gcmSendEndpoint = GcmSendEndpoint
 //		/* ... */
 //	}
 type Sender struct {
-	ApiKey string
-	Http   *http.Client
+	ApiKey          string
+	Http            *http.Client
+	InputChannel    chan *Message
+	ResponseChannel chan *Response
+}
+
+// NewSender creates a new Sender object and initialises the input and output channels
+// A non-nil error indicates that the sender could not be created.
+// Once created, you can use the Sender.InputChannel to write messages which need to be sent
+// and use the Sender.ResponseChannel to get back Responses
+
+func NewSender(api_key string, http_client *http.Client) (*Sender, error) {
+	if api_key == "" {
+		return nil, errors.New("the sender's API key must not be empty")
+	}
+	if http_client == nil {
+		http_client = new(http.Client)
+	}
+	sender := &Sender{ApiKey: api_key, Http: http_client}
+	sender.initGcmChannels()
+
+	return sender, nil
 }
 
 // SendNoRetry sends a message to the GCM server without retrying in case of
@@ -154,6 +180,24 @@ func (s *Sender) Send(msg *Message, retries int) (*Response, error) {
 		CanonicalIDs: canonicalIDs,
 		Results:      finalResults,
 	}, nil
+}
+
+func (sender *Sender) initGcmChannels() (chan *Message, chan *Response) {
+	sender.InputChannel = make(chan *Message, sizeOfInputChannels)
+	sender.ResponseChannel = make(chan *Response, sizeOfResponseChannel)
+	go func() {
+		for {
+			nextMessage := <-sender.InputChannel
+			response, err := sender.Send(nextMessage, numberOfRetries)
+			if err != nil {
+				fmt.Println("Failed to send message:", err)
+				return
+			} else {
+				go func() { sender.ResponseChannel <- response }()
+			}
+		}
+	}()
+	return sender.InputChannel, sender.ResponseChannel
 }
 
 // updateStatus updates the status of the messages sent to devices and
